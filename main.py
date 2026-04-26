@@ -268,7 +268,12 @@ def _prepare_yt_cookiefile() -> str | None:
 
     if cookies_b64:
         try:
-            content = base64.b64decode(cookies_b64).decode("utf-8")
+            normalized = "".join(cookies_b64.split())
+            # Auto-fix missing padding and accept URL-safe base64 variants.
+            pad_len = (-len(normalized)) % 4
+            if pad_len:
+                normalized += "=" * pad_len
+            content = base64.b64decode(normalized, altchars=b"-_", validate=False).decode("utf-8")
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Invalid YTDLP_COOKIES_TXT_B64 value: {exc}") from exc
     elif cookies_raw:
