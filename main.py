@@ -3,6 +3,7 @@ import uuid
 import json
 import asyncio
 import time
+import base64
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
@@ -255,6 +256,32 @@ def _safe_duration_from_gap(start_timestamp: str, end_timestamp: str, fallback_s
         return max(min_seconds, min(60, fallback_seconds))
 
 
+def _prepare_yt_cookiefile() -> str | None:
+    """
+    Optional cookie sources for yt-dlp on cloud runners:
+    - YTDLP_COOKIES_TXT_B64: base64-encoded cookies.txt content
+    - YTDLP_COOKIES_TXT: raw cookies.txt content
+    """
+    cookies_b64 = os.getenv("YTDLP_COOKIES_TXT_B64")
+    cookies_raw = os.getenv("YTDLP_COOKIES_TXT")
+    content: str | None = None
+
+    if cookies_b64:
+        try:
+            content = base64.b64decode(cookies_b64).decode("utf-8")
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Invalid YTDLP_COOKIES_TXT_B64 value: {exc}") from exc
+    elif cookies_raw:
+        content = cookies_raw
+
+    if not content:
+        return None
+
+    cookie_path = UPLOADS_DIR / "yt_cookies.txt"
+    cookie_path.write_text(content, encoding="utf-8")
+    return str(cookie_path)
+
+
 def _download_youtube_video(youtube_url: str, destination: Path) -> Path:
     try:
         import yt_dlp
@@ -272,11 +299,37 @@ def _download_youtube_video(youtube_url: str, destination: Path) -> Path:
         "outtmpl": template,
         "quiet": True,
         "no_warnings": True,
+        "retries": 5,
+        "fragment_retries": 5,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+        },
+        "extractor_args": {
+            "youtube": {"player_client": ["android", "web"]},
+        },
     }
+    cookiefile = _prepare_yt_cookiefile()
+    if cookiefile:
+        options["cookiefile"] = cookiefile
+
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             ydl.extract_info(youtube_url, download=True)
     except Exception as exc:
+        message = str(exc)
+        if "Sign in to confirm you’re not a bot" in message or "Sign in to confirm you're not a bot" in message:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "YouTube blocked anonymous download. Configure YTDLP_COOKIES_TXT_B64 "
+                    "(preferred) or YTDLP_COOKIES_TXT in Railway service variables using an "
+                    "exported YouTube cookies.txt, then retry."
+                ),
+            ) from exc
         raise HTTPException(status_code=502, detail=f"Failed to download YouTube video: {exc}") from exc
 
     mp4_files = list(destination.parent.glob(f"{destination.stem}*.mp4"))
