@@ -793,7 +793,10 @@ def _update_pipeline_job(
 async def _run_pipeline_prototype_core(
     *,
     base_url: str,
-    youtube_url: str,
+    youtube_url: str | None,
+    background_video_url: str | None,
+    background_video_bytes: bytes | None,
+    background_filename: str | None,
     viewer_profile: ViewerProfile,
     caption_density: CaptionDensity,
     max_gaps: int,
@@ -807,6 +810,17 @@ async def _run_pipeline_prototype_core(
     job_id: str | None = None,
 ) -> PipelinePrototypeResponse:
     t0 = time.perf_counter()
+    provided_sources = [
+        bool(youtube_url),
+        bool(background_video_url),
+        bool(background_video_bytes),
+    ]
+    if sum(provided_sources) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide exactly one source: youtube_url, background_video_url, or background_video_file.",
+        )
+
     if max_gaps < 1 or max_gaps > 20:
         raise HTTPException(status_code=400, detail="max_gaps must be between 1 and 20.")
     if fallback_gap_seconds < 1 or fallback_gap_seconds > 60:
@@ -819,13 +833,20 @@ async def _run_pipeline_prototype_core(
         raise HTTPException(status_code=400, detail="max_poll_rounds must be between 1 and 300.")
 
     if job_id:
-        _update_pipeline_job(job_id, status="running", stage="analyzing", message="Analyzing YouTube video", progress=0.05)
+        _update_pipeline_job(job_id, status="running", stage="analyzing", message="Analyzing source video", progress=0.05)
 
-    video_part = types.Part(file_data=types.FileData(file_uri=youtube_url))
+    if background_video_bytes is not None:
+        video_part = types.Part.from_bytes(data=background_video_bytes, mime_type="video/mp4")
+        fallback_title = Path(background_filename or "uploaded-video.mp4").stem
+    else:
+        source_uri = youtube_url or background_video_url
+        video_part = types.Part(file_data=types.FileData(file_uri=source_uri))
+        fallback_title = "source-video"
+
     analysis = await asyncio.to_thread(
         _run_gemini_analysis,
         video_part,
-        "youtube-video",
+        fallback_title,
         viewer_profile,
         caption_density,
     )
@@ -834,11 +855,16 @@ async def _run_pipeline_prototype_core(
         raise HTTPException(status_code=400, detail="Gemini analysis returned no gaps to process.")
 
     if job_id:
-        _update_pipeline_job(job_id, stage="download_background", message="Downloading source YouTube video", progress=0.12)
+        _update_pipeline_job(job_id, stage="prepare_background", message="Preparing source background video", progress=0.12)
 
     pipeline_id = uuid.uuid4().hex
     background_path = UPLOADS_DIR / f"{pipeline_id}_background.mp4"
-    await asyncio.to_thread(_download_youtube_video, youtube_url, background_path)
+    if background_video_bytes is not None:
+        await asyncio.to_thread(background_path.write_bytes, background_video_bytes)
+    elif background_video_url:
+        await asyncio.to_thread(_download_url_to_path, background_video_url, background_path)
+    elif youtube_url:
+        await asyncio.to_thread(_download_youtube_video, youtube_url, background_path)
 
     async def _process_gap(index: int, gap: GapSegment) -> tuple[int, str | None, dict | None]:
         reference_type = await asyncio.to_thread(_classify_reference_type, gap.title, gap.content)
@@ -1035,7 +1061,9 @@ async def _run_pipeline_prototype_core(
 @app.post("/pipeline-prototype", response_model=PipelinePrototypeResponse)
 async def run_pipeline_prototype(
     request: Request,
-    youtube_url: str = Form(...),
+    youtube_url: str | None = Form(default=None),
+    background_video_url: str | None = Form(default=None),
+    background_video_file: UploadFile | None = File(default=None),
     viewer_profile: ViewerProfile = Form(default="newcomer"),
     caption_density: CaptionDensity = Form(default="subtle"),
     max_gaps: int = Form(default=5),
@@ -1048,9 +1076,20 @@ async def run_pipeline_prototype(
     body_text_color: str | None = Form(default=None),
 ) -> PipelinePrototypeResponse:
     base_url = str(request.base_url).rstrip("/")
+    background_bytes: bytes | None = None
+    background_filename: str | None = None
+    if background_video_file is not None:
+        background_bytes = await background_video_file.read()
+        if not background_bytes:
+            raise HTTPException(status_code=400, detail="background_video_file is empty.")
+        background_filename = background_video_file.filename
+
     return await _run_pipeline_prototype_core(
         base_url=base_url,
         youtube_url=youtube_url,
+        background_video_url=background_video_url,
+        background_video_bytes=background_bytes,
+        background_filename=background_filename,
         viewer_profile=viewer_profile,
         caption_density=caption_density,
         max_gaps=max_gaps,
@@ -1067,7 +1106,9 @@ async def run_pipeline_prototype(
 @app.post("/pipeline-jobs", response_model=PipelineJobStartResponse)
 async def start_pipeline_job(
     request: Request,
-    youtube_url: str = Form(...),
+    youtube_url: str | None = Form(default=None),
+    background_video_url: str | None = Form(default=None),
+    background_video_file: UploadFile | None = File(default=None),
     viewer_profile: ViewerProfile = Form(default="newcomer"),
     caption_density: CaptionDensity = Form(default="subtle"),
     max_gaps: int = Form(default=5),
@@ -1079,6 +1120,14 @@ async def start_pipeline_job(
     title_text_color: str | None = Form(default=None),
     body_text_color: str | None = Form(default=None),
 ) -> PipelineJobStartResponse:
+    background_bytes: bytes | None = None
+    background_filename: str | None = None
+    if background_video_file is not None:
+        background_bytes = await background_video_file.read()
+        if not background_bytes:
+            raise HTTPException(status_code=400, detail="background_video_file is empty.")
+        background_filename = background_video_file.filename
+
     job_id = uuid.uuid4().hex
     PIPELINE_JOBS[job_id] = {
         "job_id": job_id,
@@ -1098,6 +1147,9 @@ async def start_pipeline_job(
             await _run_pipeline_prototype_core(
                 base_url=base_url,
                 youtube_url=youtube_url,
+                background_video_url=background_video_url,
+                background_video_bytes=background_bytes,
+                background_filename=background_filename,
                 viewer_profile=viewer_profile,
                 caption_density=caption_density,
                 max_gaps=max_gaps,
